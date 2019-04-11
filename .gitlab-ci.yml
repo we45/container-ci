@@ -1,0 +1,91 @@
+stages:
+  - build
+  - scan
+
+build:
+  image: docker:latest
+  stage: build
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - echo "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - docker build --pull -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+
+dockerfile_scan:
+  image: docker:stable
+  stage: scan
+  variables:
+    DOCKER_DRIVER: overlay2
+  allow_failure: true
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - docker run hadolint/hadolint < Dockerfile >> hadolint-results.txt
+  artifacts:
+    paths: [hadolint-results.txt]
+    expire_in: 1 week
+
+clair_scan:
+  image: docker:stable
+  stage: scan
+  variables:
+    DOCKER_DRIVER: overlay2
+  allow_failure: true
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - docker run -d --name db arminc/clair-db:latest
+    - docker run -p 6060:6060 --link db:postgres -d --name clair --restart on-failure arminc/clair-local-scan:v2.0.1
+    - apk add -U wget ca-certificates
+    - docker pull ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}
+    - wget https://github.com/arminc/clair-scanner/releases/download/v8/clair-scanner_linux_amd64
+    - mv clair-scanner_linux_amd64 clair-scanner
+    - chmod +x clair-scanner
+    - touch clair-whitelist.yml
+    - while( ! wget -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; done
+    - retries=0
+    - echo "Waiting for clair daemon to start"
+    - while( ! wget -T 10 -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; echo -n "." ; if [ $retries -eq 10 ] ; then echo " Timeout, aborting." ; exit 1 ; fi ; retries=$(($retries+1)) ; done
+    - ./clair-scanner -c http://docker:6060 --ip $(hostname -i) -r clair-scan-report.json -l clair.log -w clair-whitelist.yml ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA} || true
+  artifacts:
+    paths: [clair-scan-report.json]
+    expire_in: 1 week
+
+anchore_scan:
+  image: 
+    name: anchore/anchore-engine:v0.3.0
+    entrypoint: [""]
+  stage: scan
+  services:
+    - name: anchore/engine-db-preload:v0.3.0
+      alias: anchore-db
+  variables:
+    GIT_STRATEGY: none
+    ANCHORE_FAIL_ON_POLICY: "false"
+    ANCHORE_TIMEOUT: 500
+  script:
+    - |
+        curl -o /tmp/anchore_ci_tools.py https://raw.githubusercontent.com/anchore/ci-tools/v0.3.0/scripts/anchore_ci_tools.py
+        chmod +x /tmp/anchore_ci_tools.py
+        ln -s /tmp/anchore_ci_tools.py /usr/local/bin/anchore_ci_tools
+    - anchore_ci_tools --setup
+    - anchore-cli --u admin --p foobar registry add "$CI_REGISTRY" gitlab-ci-token "$CI_JOB_TOKEN" --skip-validate
+    - anchore_ci_tools --analyze --report --image "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}" --timeout "$ANCHORE_TIMEOUT"
+    - |
+        if [ "$ANCHORE_FAIL_ON_POLICY" == "true" ]; then
+          anchore-cli evaluate check "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}"
+        else
+          set +o pipefail
+          anchore-cli evaluate check "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}" | tee /dev/null
+        fi
+  artifacts:
+    paths:
+      - anchore-reports/*
+    expire_in: 1 week
