@@ -89,3 +89,27 @@ anchore_scan:
     paths:
       - anchore-reports/*
     expire_in: 1 week
+
+trivy_scan:
+  image:
+    name: docker:stable
+  stage: scan
+  services:
+    - docker:dind
+  variables:
+    TRIVY_AUTH_URL: $CI_REGISTRY
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker pull ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}
+    - apk add -U wget ca-certificates tar curl git
+    - export VERSION=$(curl --silent "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - wget https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz
+    - tar zxvf trivy_${VERSION}_Linux-64bit.tar.gz
+  script:
+    - ./trivy -f json -o trivy_result.json --exit-code 0 --auto-refresh ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}
+  artifacts:
+    paths:
+      - trivy_result.json
+    expire_in: 1 week
